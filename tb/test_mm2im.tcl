@@ -1,10 +1,11 @@
-# Jude: Created
+# Jude: Created MM2IMv2
 # csim + csynth + cosim of the MM2IM kernel for one golden configuration:
 #   cd tb && python3 gen_mm2im_golden.py --cfg ... --out <dir>
-#   MM2IM_CFG=<dir> [MM2IM_SKIP=0|1] [MM2IM_PROJ=name] FINN_HLS_ROOT=.. vitis_hls -f test_mm2im.tcl
+#   MM2IM_CFG=<dir> [MM2IM_SKIP=0|1] [MM2IM_STREAM=0|1] [MM2IM_PROJ=name] FINN_HLS_ROOT=.. vitis_hls -f test_mm2im.tcl
 set cfg $::env(MM2IM_CFG)
 set skip [expr {[info exists ::env(MM2IM_SKIP)] ? $::env(MM2IM_SKIP) : 1}]
-set flags "-std=c++14 -I$::env(FINN_HLS_ROOT) -I$::env(FINN_HLS_ROOT)/tb -I$cfg -DMM2IM_SKIP=$skip"
+set stream [expr {[info exists ::env(MM2IM_STREAM)] ? $::env(MM2IM_STREAM) : 0}]
+set flags "-std=c++14 -I$::env(FINN_HLS_ROOT) -I$::env(FINN_HLS_ROOT)/tb -I$cfg -DMM2IM_SKIP=$skip -DMM2IM_STREAM=$stream"
 set proj [expr {[info exists ::env(MM2IM_PROJ)] ? $::env(MM2IM_PROJ) : "hls-syn-mm2im"}]
 open_project -reset $proj
 add_files mm2im_top.cpp -cflags $flags

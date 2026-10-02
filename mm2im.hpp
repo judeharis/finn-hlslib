@@ -1,4 +1,4 @@
-// Jude: Created
+// Jude: Created MM2IMv2
 /******************************************************************************
  *  MM2IM transposed convolution (input-stationary scatter), streaming NHWC.
  *
@@ -30,6 +30,14 @@
  *  output channel co = cf*PE + pe, input channel ci = sf*SIMD + simd. From a
  *  FINN weight tensor W[CO][K][K][CI] (numpy):
  *    W.reshape(CF,PE,K,K,SF,SIMD).transpose(2,3,0,4,1,5).reshape(-1,PE,SIMD)
+ *
+ *  Two entry points share one core:
+ *   - mm2im():        weights in an embedded ROM, SKIP selectable.
+ *   - mm2im_stream(): weights streamed, one PE*SIMD word per compute step,
+ *                     element pe*SIMD + simd (compact=bit: element 0 in the
+ *                     LSBs). SKIP is off, so every input pixel consumes the same
+ *                     K*K*CF*SF words t = 0, 1, ...: a memstream looping over
+ *                     that depth feeds it.
  ******************************************************************************/
 #ifndef MM2IM_HPP
 #define MM2IM_HPP
@@ -39,6 +47,23 @@
 #include <hls_vector.h>
 
 #include "mm2im_sched.hpp"
+
+/**
+ * v / S for a small v < K. A power-of-two S is a shift; otherwise (K-1)/S unrolled
+ * compares, since a constant divider by a non-power-of-two S is built as a multi-stage
+ * divider and lengthens the pipeline (K2 S3: depth 39 instead of 6).
+ */
+template<unsigned  K, unsigned  S>
+unsigned mm2im_div(unsigned const  v) {
+#pragma HLS inline
+	if((S & (S-1)) == 0)  return  v / S;
+	unsigned  q = 0;
+	for(unsigned  j = 1; j <= (K-1)/S; j++) {
+#pragma HLS unroll
+		if(v >= j*S)  q++;
+	}
+	return  q;
+}
 
 /**
  * Emit and clear the kept rows of output band b, held in accumulator bank `bank`.
@@ -82,28 +107,50 @@ void mm2im_drain(
 	}
 } // mm2im_drain()
 
+/**
+ * Weight sources of the core: return the PE*SIMD weights of compute step t,
+ * element pe*SIMD + simd. Called exactly once per compute step.
+ */
+template<unsigned  WMEM, size_t  PE, size_t  SIMD, typename  TW>
+struct mm2im_rom_weights {
+	TW const (&kernel)[WMEM][PE][SIMD];
+	hls::vector<TW, PE*SIMD> operator()(unsigned const  t) const {
+#pragma HLS inline
+		hls::vector<TW, PE*SIMD>  w;
+		for(unsigned  pe = 0; pe < PE; pe++) {
+#pragma HLS unroll
+			for(unsigned  s = 0; s < SIMD; s++) {
+#pragma HLS unroll
+				w[pe*SIMD + s] = kernel[t][pe][s];
+			}
+		}
+		return  w;
+	}
+};
+template<size_t  PE, size_t  SIMD, typename  TW>
+struct mm2im_stream_weights {
+	hls::stream<hls::vector<TW, PE*SIMD>> &wgt;
+	hls::vector<TW, PE*SIMD> operator()(unsigned const) const {
+#pragma HLS inline
+		return  wgt.read();
+	}
+};
+
+/**
+ * The kernel; see the file header. WS is the weight source.
+ */
 template<
-	unsigned  K,	// kernel size
-	unsigned  S,	// stride
-	unsigned  P,	// (de)padding, P < K
-	unsigned  H,	// input height
-	unsigned  W,	// input width
-	unsigned  CO,	// output channels
-	unsigned  CI,	// input channels
-	size_t    PE,	// output channels in parallel
-	size_t    SIMD,	// input channels in parallel
-	typename  TW,	// weight type
-	typename  TI,	// input type
-	typename  TO,	// output type
-	typename  TA = TO,	// accumulator type
-	bool      SKIP = true,	// skip taps that land in the crop
-	unsigned  L = 4		// RMW forwarding window (RMW events)
+	unsigned  K, unsigned  S, unsigned  P, unsigned  H, unsigned  W,
+	unsigned  CO, unsigned  CI, size_t  PE, size_t  SIMD,
+	typename  TI, typename  TO, typename  TA, bool  SKIP, unsigned  L,
+	typename  WS
 >
-void mm2im(
-	TW const (&kernel)[K*K*(CO/PE)*(CI/SIMD)][PE][SIMD],
+void mm2im_core(
+	WS const &weights,
 	hls::stream<hls::vector<TI, SIMD>> &src,
 	hls::stream<hls::vector<TO, PE>>   &dst
 ) {
+#pragma HLS inline
 	static_assert(CO%PE   == 0, "PE parallelism must divide output channel count.");
 	static_assert(CI%SIMD == 0, "SIMD parallelism must divide input channel count.");
 	static_assert(L > 0, "Forwarding window must not be empty.");
@@ -116,9 +163,6 @@ void mm2im(
 	constexpr unsigned  WO = G::WO;
 	constexpr unsigned  TX = G::taps_x(SKIP);
 	constexpr unsigned  DEPTH = NB*S*WO*CF;
-
-#pragma HLS array_partition variable=kernel complete dim=2
-#pragma HLS array_partition variable=kernel complete dim=3
 
 	// Accumulator: bank (band mod NB), row in band, output column, cf; PE lanes.
 	// Static and zero-initialised; every drained entry is cleared again.
@@ -170,12 +214,13 @@ void mm2im(
 
 			// PE x SIMD MACs into the per-PE partial sum.
 			unsigned const  t = ((ky*K + kx)*CF + cf)*SF + sf;
+			auto const  w = weights(t);
 			for(unsigned  pe = 0; pe < PE; pe++) {
 #pragma HLS unroll
 				TA  p = (sf == 0)? TA(0) : psum[pe];
 				for(unsigned  s = 0; s < SIMD; s++) {
 #pragma HLS unroll
-					p += kernel[t][pe][s] * x[s];
+					p += w[pe*SIMD + s] * x[s];
 				}
 				psum[pe] = p;
 			}
@@ -186,9 +231,10 @@ void mm2im(
 				unsigned const  c = iw*S + kx;	// full output column
 				bool const  keep = SKIP || ((r >= P) && (r < P+HO) && (c >= P) && (c < P+WO));
 				if(keep) {
-					unsigned  bank = bank0 + ky/S;
+					unsigned const  kq = mm2im_div<K, S>(ky);	// band offset ky/S
+					unsigned  bank = bank0 + kq;
 					if(bank >= NB)  bank -= NB;
-					unsigned const  addr = ((bank*S + ky%S)*WO + (c - P))*CF + cf;
+					unsigned const  addr = ((bank*S + (ky - kq*S))*WO + (c - P))*CF + cf;
 
 					TA  v[PE];
 #pragma HLS array_partition variable=v complete
@@ -262,6 +308,56 @@ void mm2im(
 		bank0 = (bank0 == NB-1)? 0 : bank0 + 1;
 	}
 
+} // mm2im_core()
+
+/**
+ * MM2IM with the weights in an embedded ROM.
+ */
+template<
+	unsigned  K,	// kernel size
+	unsigned  S,	// stride
+	unsigned  P,	// (de)padding, P < K
+	unsigned  H,	// input height
+	unsigned  W,	// input width
+	unsigned  CO,	// output channels
+	unsigned  CI,	// input channels
+	size_t    PE,	// output channels in parallel
+	size_t    SIMD,	// input channels in parallel
+	typename  TW,	// weight type
+	typename  TI,	// input type
+	typename  TO,	// output type
+	typename  TA = TO,	// accumulator type
+	bool      SKIP = true,	// skip taps that land in the crop
+	unsigned  L = 4		// RMW forwarding window (RMW events)
+>
+void mm2im(
+	TW const (&kernel)[K*K*(CO/PE)*(CI/SIMD)][PE][SIMD],
+	hls::stream<hls::vector<TI, SIMD>> &src,
+	hls::stream<hls::vector<TO, PE>>   &dst
+) {
+#pragma HLS array_partition variable=kernel complete dim=2
+#pragma HLS array_partition variable=kernel complete dim=3
+	mm2im_rom_weights<K*K*(CO/PE)*(CI/SIMD), PE, SIMD, TW> const  weights{kernel};
+	mm2im_core<K, S, P, H, W, CO, CI, PE, SIMD, TI, TO, TA, SKIP, L>(weights, src, dst);
 } // mm2im()
+
+/**
+ * MM2IM with streamed weights: K*K*(CO/PE)*(CI/SIMD) words per input pixel, the
+ * same sequence for every pixel (SKIP off).
+ */
+template<
+	unsigned  K, unsigned  S, unsigned  P, unsigned  H, unsigned  W,
+	unsigned  CO, unsigned  CI, size_t  PE, size_t  SIMD,
+	typename  TW, typename  TI, typename  TO, typename  TA = TO,
+	unsigned  L = 4
+>
+void mm2im_stream(
+	hls::stream<hls::vector<TW, PE*SIMD>> &wgt,
+	hls::stream<hls::vector<TI, SIMD>>    &src,
+	hls::stream<hls::vector<TO, PE>>      &dst
+) {
+	mm2im_stream_weights<PE, SIMD, TW> const  weights{wgt};
+	mm2im_core<K, S, P, H, W, CO, CI, PE, SIMD, TI, TO, TA, false, L>(weights, src, dst);
+} // mm2im_stream()
 
 #endif

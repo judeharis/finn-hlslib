@@ -1,4 +1,4 @@
-// Jude: Created
+// Jude: Created MM2IMv2
 // MM2IM testbench: feeds golden.h's input for FRAMES frames (the accumulator must
 // come back clean after every frame) and compares every output word with the
 // golden, which tb/gen_mm2im_golden.py checked against numpy, PyTorch and the
@@ -27,7 +27,27 @@ int main() {
 			}
 		}
 
+#if MM2IM_STREAM
+		// the same K*K*CF*SF weight words for every input pixel
+		hls::stream<hls::vector<TW, PE*SIMD>>  wgt;
+		constexpr unsigned  WMEM = K*K*CF*SF;
+		for(unsigned  pix = 0; pix < H*W; pix++) {
+			for(unsigned  t = 0; t < WMEM; t++) {
+				hls::vector<TW, PE*SIMD>  w;
+				for(unsigned  pe = 0; pe < PE; pe++) {
+					for(unsigned  s = 0; s < SIMD; s++)  w[pe*SIMD + s] = KERNEL[t][pe][s];
+				}
+				wgt.write(w);
+			}
+		}
+		mm2im_top(wgt, src, dst);
+		if(!wgt.empty()) {
+			std::cerr << "frame " << frame << ": weights not fully consumed" << std::endl;
+			errors++;
+		}
+#else
 		mm2im_top(src, dst);
+#endif
 
 		if(!src.empty()) {
 			std::cerr << "frame " << frame << ": input not fully consumed" << std::endl;
@@ -61,8 +81,8 @@ int main() {
 
 	std::cout << (errors? "FAIL" : "PASS") << " K=" << K << " S=" << S << " P=" << P
 	          << " H=" << H << " W=" << W << " CI=" << CI << " CO=" << CO
-	          << " PE=" << PE << " SIMD=" << SIMD << " SKIP=" << MM2IM_SKIP
-	          << " frames=" << FRAMES << " errors=" << errors
-	          << " iterations/frame=" << (MM2IM_SKIP? ITER_SKIP : ITER_NOSKIP) << std::endl;
+	          << " PE=" << PE << " SIMD=" << SIMD << " SKIP=" << (MM2IM_SKIP && !MM2IM_STREAM)
+	          << " STREAM=" << MM2IM_STREAM << " frames=" << FRAMES << " errors=" << errors
+	          << " iterations/frame=" << (MM2IM_SKIP && !MM2IM_STREAM? ITER_SKIP : ITER_NOSKIP) << std::endl;
 	return  errors? 1 : 0;
 }

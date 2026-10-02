@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Jude: Created
+# Jude: Created MM2IMv2
 # Fast C simulation sweep of the MM2IM kernel with g++ (no Vitis HLS run needed):
-# generates each configuration's golden, compiles tb + top, runs 2 frames, with
-# SKIP on and off. Prints one PASS/FAIL line per run; exit code = number of failures.
+# generates each configuration's golden, compiles tb + top, runs 2 frames, with ROM
+# weights and SKIP on and off, and with streamed weights (mm2im_stream). Prints one
+# PASS/FAIL line per run; exit code = number of failures.
 #   ./run_mm2im_csim.sh                  # default sweep
 #   XILINX_HLS=/path/to/Vitis_HLS/2024.1 ./run_mm2im_csim.sh
 set -u
@@ -30,21 +31,21 @@ CONFIGS=(
 
 fails=0
 run_one() {
-  local cfg="$1" skip="$2"
+  local cfg="$1" skip="$2" stream="$3"
   set -- $cfg
   local dir
   dir=$(python3 "$TB/gen_mm2im_golden.py" --cfg "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" \
         --idt "${10}" --wdt "${11}") || { echo "FAIL golden generation for: $cfg"; return 1; }
-  local bin="$dir/csim_skip$skip"
-  g++ -std=c++14 -O2 -w -I"$XILINX_HLS/include" -I"$ROOT" -I"$TB" -I"$dir" -DMM2IM_SKIP="$skip" \
+  local bin="$dir/csim_skip${skip}_stream$stream"
+  g++ -std=c++14 -O2 -w -I"$XILINX_HLS/include" -I"$ROOT" -I"$TB" -I"$dir" -DMM2IM_SKIP="$skip" -DMM2IM_STREAM="$stream" \
       "$TB/mm2im_tb.cpp" "$TB/mm2im_top.cpp" -o "$bin" 2> "$bin.log" \
-      || { echo "FAIL compile ($cfg, SKIP=$skip): see $bin.log"; return 1; }
+      || { echo "FAIL compile ($cfg, SKIP=$skip, STREAM=$stream): see $bin.log"; return 1; }
   "$bin"
 }
 for cfg in "${CONFIGS[@]}"; do
-  for skip in 1 0; do
-    run_one "$cfg" "$skip" || fails=$((fails+1))
+  for mode in "1 0" "0 0" "0 1"; do
+    run_one "$cfg" $mode || fails=$((fails+1))
   done
 done
-echo "csim sweep: $(( ${#CONFIGS[@]} * 2 - fails )) / $(( ${#CONFIGS[@]} * 2 )) passed"
+echo "csim sweep: $(( ${#CONFIGS[@]} * 3 - fails )) / $(( ${#CONFIGS[@]} * 3 )) passed"
 exit $fails

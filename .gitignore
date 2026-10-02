@@ -1,5 +1,7 @@
-# Jude: Created
+# Jude: Created MM2IMv2
 # Goldens and csim binaries written by tb/gen_mm2im_golden.py / tb/run_mm2im_csim.sh
 tb/data/mm2im/
 # Vitis HLS projects of the MM2IM testbench
 tb/hls-syn-mm2im*/
+# Python bytecode of tb/gen_mm2im_golden.py
+tb/__pycache__/

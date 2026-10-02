@@ -1,4 +1,4 @@
-// Jude: Created
+// Jude: Created MM2IMv2
 /******************************************************************************
  *  Geometry and tap schedule of the MM2IM transposed convolution.
  *
@@ -71,6 +71,12 @@ struct mm2im_geom {
 		for(unsigned  i = 0; i < H; i++)  n += (unsigned long long)taps_y(i, skip) * taps_x(skip) * CF * SF;
 		for(unsigned  b = 0; b < BANDS; b++)  n += (unsigned long long)rows_kept(b) * WO * CF;
 		return  n;
+	}
+	// Expected cycles of one frame: iterations plus a pipeline fill/flush per input row.
+	// Constants fitted to cosim/rtlsim (tb/gen_mm2im_golden.py CYCLE_ROW, CYCLE_CONST; keep
+	// equal); accurate to max(3%, 6 cycles per input row).
+	static constexpr unsigned long long exp_cycles(unsigned CF, unsigned SF, bool skip) {
+		return  iterations(CF, SF, skip) + ((skip? 21ull : 17ull)*H > 34? (skip? 21ull : 17ull)*H - 34 : 0);
 	}
 };
 
